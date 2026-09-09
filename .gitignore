@@ -1,0 +1,26 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Credentials & Session Data (CRITICAL)
+li_at.txt
+linkedin-profile/
+*.session
+*.cookie
+.env
+.env.*
+
+# Scraped output & temporary dumps
+*.html
+*.json
+!package.json
+!tsconfig.json
