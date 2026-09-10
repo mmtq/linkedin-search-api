@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: linkedin-scraper-api
+    env: docker
+    dockerfilePath: Dockerfile
+    plan: starter
+    region: oregon
+    healthCheckPath: /api/health
+    envVars:
+      - key: LI_AT
+        sync: false # Set your li_at cookie value in the Render dashboard
+      - key: HEADLESS
+        value: "true"
+      - key: HOST
+        value: "0.0.0.0"

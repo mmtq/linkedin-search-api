@@ -1,0 +1,9 @@
+.venv
+__pycache__
+*.pyc
+.git
+.gitignore
+linkedin-profile
+*.html
+scratch
+.system_generated
