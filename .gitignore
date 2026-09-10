@@ -12,7 +12,6 @@ venv/
 ENV/
 
 # Credentials & Session Data (CRITICAL)
-li_at.txt
 linkedin-profile/
 *.session
 *.cookie
