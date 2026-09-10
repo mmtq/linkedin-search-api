@@ -93,9 +93,8 @@ def _expand_all_inline_posts(page):
 
 def _safe_goto(page, context, url: str, timeout: int = 40000):
     """
-    Navigates safely to LinkedIn URLs. If an expired/stale li_at cookie causes an infinite redirect
-    loop (net::ERR_TOO_MANY_REDIRECTS), it automatically clears cookies, reopens a clean page,
-    and seamlessly loads the page as a public guest session without failing the request.
+    Navigates safely to LinkedIn URLs preserving the authenticated session state.
+    If a navigation glitch occurs, it re-verifies session cookies and retries.
     """
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=timeout)
@@ -103,16 +102,12 @@ def _safe_goto(page, context, url: str, timeout: int = 40000):
     except Exception as e:
         err_msg = str(e)
         if "ERR_TOO_MANY_REDIRECTS" in err_msg or "net::ERR_" in err_msg:
-            print(f"Notice: Redirect loop detected ({err_msg}). Clearing stale cookies and retrying as clean guest session...")
-            try:
-                page.close()
-            except Exception:
-                pass
-            context.clear_cookies()
-            new_page = context.new_page()
-            new_page.set_viewport_size({"width": 1920, "height": 1080})
-            new_page.goto(url, wait_until="domcontentloaded", timeout=timeout)
-            return new_page
+            print(f"Notice: Navigation retry on ({err_msg}). Re-verifying authenticated cookies...", flush=True)
+            from app.core.browser import inject_auth_cookies
+            inject_auth_cookies(context)
+            time.sleep(1.0)
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+            return page
         else:
             raise e
 
@@ -163,9 +158,15 @@ class LinkedInScraperService:
                     for i in range(cards_to_process):
                         try:
                             card = cards_loc.nth(i)
-                            card.scroll_into_view_if_needed()
-                            card.click()
-                            human_sleep(0.3, 0.5)
+                            try:
+                                card.scroll_into_view_if_needed(timeout=2000)
+                            except Exception:
+                                pass
+                            try:
+                                card.click(timeout=2000, force=True)
+                            except Exception:
+                                pass
+                            human_sleep(0.2, 0.4)
 
                             # Expand the job description pane completely (clicks 'See more' / 'আরও দেখুন')
                             page.evaluate("""() => {
@@ -360,10 +361,13 @@ class LinkedInScraperService:
 
                     if loc.count() > 0:
                         try:
-                            loc.first.scroll_into_view_if_needed()
-                            loc.first.click()
+                            try:
+                                loc.first.scroll_into_view_if_needed(timeout=2000)
+                            except Exception:
+                                pass
+                            loc.first.click(timeout=2000, force=True)
                             print(f"  -> Successfully clicked load more on batch {round_num}")
-                            human_sleep(3.5, 4.5)
+                            human_sleep(3.0, 4.0)
                         except Exception as e:
                             print(f"  -> Click note on batch {round_num}: {e}")
 

@@ -23,7 +23,7 @@ class ChromeProcessManager:
 
     def is_ready(self) -> bool:
         try:
-            with urllib.request.urlopen(f"{settings.CDP_URL}/json/version", timeout=1) as resp:
+            with urllib.request.urlopen(f"{settings.CDP_URL}/json/version", timeout=0.5) as resp:
                 return resp.status == 200
         except Exception:
             return False
@@ -35,7 +35,11 @@ class ChromeProcessManager:
                     # Cloud/Render environment: Native Playwright Chromium will be used directly
                     return
 
-                print(f"Starting background Chrome Dev daemon (headless={self.headless})...")
+                if str(settings.DEBUG_PORT) not in settings.CDP_URL:
+                    # Custom CDP URL configured; do not spawn local daemon
+                    return
+
+                print(f"Starting background Chrome Dev daemon (headless={self.headless})...", flush=True)
                 cmd = [
                     settings.CHROME_DEV_PATH,
                     f"--remote-debugging-port={settings.DEBUG_PORT}",
@@ -48,13 +52,13 @@ class ChromeProcessManager:
 
                 try:
                     self.process = subprocess.Popen(cmd)
-                    for _ in range(30):
+                    for _ in range(10):
                         if self.is_ready():
-                            print("Background Chrome Dev daemon is ready.")
+                            print("Background Chrome Dev daemon is ready.", flush=True)
                             break
-                        time.sleep(0.5)
+                        time.sleep(0.3)
                 except Exception as e:
-                    print(f"Notice: Could not launch local Chrome binary ({e}). Falling back to native Playwright Chromium.")
+                    print(f"Notice: Could not launch local Chrome binary ({e}). Falling back to native Playwright Chromium.", flush=True)
 
     def stop(self):
         with self._lock:
@@ -71,28 +75,33 @@ chrome_manager = ChromeProcessManager(headless=settings.HEADLESS)
 
 def inject_auth_cookies(context: BrowserContext):
     """
-    Injects the `li_at` cookie into the browser context if configured via LI_AT env var or li_at.txt.
-    Sanitizes any trailing newlines or quotation marks.
+    Injects authentication cookies into the browser context from:
+    1. COOKIES_JSON env var / cookies.json
+    2. LI_AT, JSESSIONID, BCOOKIE env vars
+    3. Local li_at.txt file
     """
-    raw_cookie = settings.get_li_at_cookie()
-    if raw_cookie:
-        li_at_cookie = raw_cookie.strip().strip('"').strip("'")
-        if li_at_cookie:
-            cookies = [
-                {
-                    "name": "li_at",
-                    "value": li_at_cookie,
-                    "domain": ".linkedin.com",
-                    "path": "/",
-                    "httpOnly": True,
-                    "secure": True,
-                    "sameSite": "None",
-                }
-            ]
-            try:
-                context.add_cookies(cookies)
-            except Exception as e:
-                print(f"Notice: Could not inject cookies into context: {e}")
+    cookies = settings.get_all_auth_cookies()
+    if cookies:
+        try:
+            # Filter and sanitize cookies for Playwright
+            cleaned = []
+            for c in cookies:
+                if isinstance(c, dict) and "name" in c and "value" in c:
+                    cookie_dict = {
+                        "name": str(c["name"]).strip(),
+                        "value": str(c["value"]).strip(),
+                        "domain": str(c.get("domain") or ".linkedin.com"),
+                        "path": str(c.get("path") or "/"),
+                    }
+                    if "httpOnly" in c:
+                        cookie_dict["httpOnly"] = bool(c["httpOnly"])
+                    if "secure" in c:
+                        cookie_dict["secure"] = bool(c["secure"])
+                    cleaned.append(cookie_dict)
+            if cleaned:
+                context.add_cookies(cleaned)
+        except Exception as e:
+            print(f"Notice: Could not inject cookies into context: {e}")
 
 
 def create_browser_session(p: Playwright) -> Tuple[Browser, BrowserContext, bool]:
@@ -118,6 +127,7 @@ def create_browser_session(p: Playwright) -> Tuple[Browser, BrowserContext, bool
             print(f"CDP connect failed ({e}), falling back to native Chromium...")
 
     # Native Playwright Chromium (Standard for Linux / Render / Docker deployment)
+    storage_state = settings.get_storage_state()
     browser = p.chromium.launch(
         headless=settings.HEADLESS,
         args=[
@@ -130,12 +140,33 @@ def create_browser_session(p: Playwright) -> Tuple[Browser, BrowserContext, bool
             "--no-default-browser-check",
         ],
     )
-    context = browser.new_context(
-        viewport={"width": 1920, "height": 1080},
-        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-        locale="en-US",
-    )
+    
+    context_kwargs = {
+        "viewport": {"width": 1920, "height": 1080},
+        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+        "locale": "en-US",
+        "extra_http_headers": {
+            "accept-language": "en-US,en;q=0.9",
+        },
+    }
+    if storage_state:
+        context_kwargs["storage_state"] = storage_state
+
+    context = browser.new_context(**context_kwargs)
+    
+    # Hide automation flags
+    try:
+        context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => undefined
+            });
+        """)
+    except Exception:
+        pass
+
+    # Ensure any active li_at or custom auth cookies are injected/updated
     inject_auth_cookies(context)
+
     return browser, context, False
 
 
