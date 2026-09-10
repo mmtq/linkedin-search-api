@@ -91,6 +91,32 @@ def _expand_all_inline_posts(page):
         pass
 
 
+def _safe_goto(page, context, url: str, timeout: int = 40000):
+    """
+    Navigates safely to LinkedIn URLs. If an expired/stale li_at cookie causes an infinite redirect
+    loop (net::ERR_TOO_MANY_REDIRECTS), it automatically clears cookies, reopens a clean page,
+    and seamlessly loads the page as a public guest session without failing the request.
+    """
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+        return page
+    except Exception as e:
+        err_msg = str(e)
+        if "ERR_TOO_MANY_REDIRECTS" in err_msg or "net::ERR_" in err_msg:
+            print(f"Notice: Redirect loop detected ({err_msg}). Clearing stale cookies and retrying as clean guest session...")
+            try:
+                page.close()
+            except Exception:
+                pass
+            context.clear_cookies()
+            new_page = context.new_page()
+            new_page.set_viewport_size({"width": 1920, "height": 1080})
+            new_page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+            return new_page
+        else:
+            raise e
+
+
 class LinkedInScraperService:
     """
     High-level scraping service that interacts with the headless Chrome daemon via Playwright,
@@ -121,11 +147,7 @@ class LinkedInScraperService:
                     url = build_jobs_url(query, location, start=start_offset, sort_by_latest=sort_by_latest)
                     print(f"Scraping Jobs [Page {page_idx + 1}/{pages}]: {url}")
 
-                    try:
-                        page.goto(url, wait_until="load", timeout=45000)
-                    except Exception:
-                        page.goto(url, wait_until="domcontentloaded", timeout=30000)
-
+                    page = _safe_goto(page, context, url, timeout=40000)
                     human_sleep(2.0, 3.5)
 
                     # Human-like progressive scrolling down the jobs list panel & clicking cards to capture descriptions
@@ -135,12 +157,15 @@ class LinkedInScraperService:
                     descriptions_by_url = {}
                     descriptions_by_title = {}
 
-                    for i in range(card_count):
+                    needed_limit = (limit - len(all_jobs)) if limit else card_count
+                    cards_to_process = min(card_count, needed_limit) if limit else card_count
+
+                    for i in range(cards_to_process):
                         try:
                             card = cards_loc.nth(i)
                             card.scroll_into_view_if_needed()
                             card.click()
-                            human_sleep(0.4, 0.7)
+                            human_sleep(0.3, 0.5)
 
                             # Expand the job description pane completely (clicks 'See more' / 'আরও দেখুন')
                             page.evaluate("""() => {
@@ -226,15 +251,18 @@ class LinkedInScraperService:
                         j["description"] = j_desc
 
                     # Guaranteed 100% fallback: if any job description is still None, fetch direct view URL
-                    for j in page_jobs:
+                    needed_limit = (limit - len(all_jobs)) if limit else len(page_jobs)
+                    target_jobs = page_jobs[:max(1, needed_limit)] if limit else page_jobs
+
+                    for j in target_jobs:
                         if not j.get("description") and j.get("url"):
                             try:
                                 print(f"  -> Direct fetching missing description for: {j.get('title')}")
                                 direct_page = context.new_page()
                                 try:
-                                    direct_page.goto(j["url"], wait_until="domcontentloaded", timeout=25000)
+                                    direct_page = _safe_goto(direct_page, context, j["url"], timeout=20000)
                                     direct_page.evaluate("window.scrollBy(0, 400)")
-                                    human_sleep(1.0, 1.5)
+                                    human_sleep(0.5, 0.8)
                                     
                                     # Expand "See more" / "Show more" button if present
                                     direct_page.evaluate("""() => {
@@ -247,13 +275,16 @@ class LinkedInScraperService:
                                             try { seeMore.click(); } catch(e) {}
                                         }
                                     }""")
-                                    human_sleep(0.5, 0.8)
+                                    human_sleep(0.3, 0.5)
 
                                     direct_desc = extract_job_description_from_html(direct_page.content())
                                     if direct_desc:
                                         j["description"] = direct_desc
                                 finally:
-                                    direct_page.close()
+                                    try:
+                                        direct_page.close()
+                                    except Exception:
+                                        pass
                             except Exception as fetch_err:
                                 print(f"  -> Fallback fetch note: {fetch_err}")
 
@@ -279,7 +310,10 @@ class LinkedInScraperService:
                     if page_idx < pages - 1:
                         human_sleep(2.0, 3.8)
 
-                Path("jobs.html").write_text(page.content(), encoding="utf-8")
+                try:
+                    Path("jobs.html").write_text(page.content(), encoding="utf-8")
+                except Exception:
+                    pass
                 return all_jobs
             finally:
                 try:
@@ -308,7 +342,7 @@ class LinkedInScraperService:
                 url = build_posts_url(query, page_num=None, sort_by_latest=sort_by_latest)
                 print(f"Scraping Posts (up to {pages} pages/batches): {url}")
 
-                page.goto(url, wait_until="load", timeout=45000)
+                page = _safe_goto(page, context, url, timeout=40000)
                 human_sleep(3.0, 4.0)
 
                 for round_num in range(1, pages + 1):
@@ -358,7 +392,10 @@ class LinkedInScraperService:
                     if round_num < pages:
                         human_sleep(1.5, 2.2)
 
-                Path("posts.html").write_text(page.content(), encoding="utf-8")
+                try:
+                    Path("posts.html").write_text(page.content(), encoding="utf-8")
+                except Exception:
+                    pass
                 return all_posts
             finally:
                 try:

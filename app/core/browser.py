@@ -72,42 +72,27 @@ chrome_manager = ChromeProcessManager(headless=settings.HEADLESS)
 def inject_auth_cookies(context: BrowserContext):
     """
     Injects the `li_at` cookie into the browser context if configured via LI_AT env var or li_at.txt.
+    Sanitizes any trailing newlines or quotation marks.
     """
-    li_at_cookie = settings.get_li_at_cookie()
-    if li_at_cookie:
-        cookies = [
-            {
-                "name": "li_at",
-                "value": li_at_cookie,
-                "domain": ".linkedin.com",
-                "path": "/",
-                "httpOnly": True,
-                "secure": True,
-                "sameSite": "None",
-            },
-            {
-                "name": "li_at",
-                "value": li_at_cookie,
-                "domain": ".www.linkedin.com",
-                "path": "/",
-                "httpOnly": True,
-                "secure": True,
-                "sameSite": "None",
-            },
-            {
-                "name": "li_at",
-                "value": li_at_cookie,
-                "domain": "www.linkedin.com",
-                "path": "/",
-                "httpOnly": True,
-                "secure": True,
-                "sameSite": "None",
-            },
-        ]
-        try:
-            context.add_cookies(cookies)
-        except Exception as e:
-            print(f"Notice: Could not inject cookies into context: {e}")
+    raw_cookie = settings.get_li_at_cookie()
+    if raw_cookie:
+        li_at_cookie = raw_cookie.strip().strip('"').strip("'")
+        if li_at_cookie:
+            cookies = [
+                {
+                    "name": "li_at",
+                    "value": li_at_cookie,
+                    "domain": ".linkedin.com",
+                    "path": "/",
+                    "httpOnly": True,
+                    "secure": True,
+                    "sameSite": "None",
+                }
+            ]
+            try:
+                context.add_cookies(cookies)
+            except Exception as e:
+                print(f"Notice: Could not inject cookies into context: {e}")
 
 
 def create_browser_session(p: Playwright) -> Tuple[Browser, BrowserContext, bool]:
