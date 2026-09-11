@@ -4,7 +4,6 @@ from app.models.schemas import (
     PostItem,
     PostsResponse,
     SearchResponse,
-    HealthResponse,
 )
 
 __all__ = [
@@ -13,5 +12,4 @@ __all__ = [
     "PostItem",
     "PostsResponse",
     "SearchResponse",
-    "HealthResponse",
 ]

@@ -1,5 +1,6 @@
 import asyncio
 import sys
+import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -43,20 +44,56 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
+    @app.middleware("http")
+    async def log_requests(request, call_next):
+        start_time = time.time()
+        client_host = request.client.host if request.client else "unknown"
+        query_str = f"?{request.url.query}" if request.url.query else ""
+        print(f"\n📥 [{time.strftime('%H:%M:%S')}] Incoming {request.method} {request.url.path}{query_str} from {client_host}", flush=True)
+        
+        try:
+            response = await call_next(request)
+            process_time = round(time.time() - start_time, 2)
+            print(f"📤 [{time.strftime('%H:%M:%S')}] Completed {request.method} {request.url.path} -> {response.status_code} ({process_time}s)", flush=True)
+            return response
+        except Exception as e:
+            process_time = round(time.time() - start_time, 2)
+            print(f"❌ [{time.strftime('%H:%M:%S')}] Failed {request.method} {request.url.path} -> {e} ({process_time}s)", flush=True)
+            raise e
+
     @app.get("/", tags=["General"])
     def root():
+        from pathlib import Path
+
+        profile_cookies_db = Path(settings.PROFILE_DIR) / "Default" / "Cookies"
+        if profile_cookies_db.exists():
+            authenticated = True
+            session_source = "persistent_profile"
+            action_required = None
+        elif settings.get_li_at_cookie():
+            authenticated = True
+            session_source = "li_at_file"
+            action_required = None
+        else:
+            authenticated = False
+            session_source = "none"
+            action_required = "Run `python login.py` to authenticate, then restart the server."
+
         return {
             "service": settings.APP_NAME,
             "version": settings.APP_VERSION,
             "status": "online",
+            "authenticated": authenticated,
+            "session_source": session_source,
+            "action_required": action_required,
             "docs": "/docs",
             "endpoints": {
                 "search_jobs": "/api/jobs?query=software%20engineer&location=Bangladesh&limit=10",
                 "search_posts": "/api/posts?query=software%20engineer&limit=10",
-                "combined_search": "/api/search?query=software%20engineer&location=Bangladesh&limit=10",
-                "health": "/api/health",
+                "search_all": "/api/search?query=software%20engineer&location=Bangladesh&limit=10",
             },
         }
+
 
     # Mount API routers
     app.include_router(api_router)

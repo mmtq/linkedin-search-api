@@ -44,8 +44,3 @@ class SearchResponse(BaseModel):
     jobs: List[JobItem]
     posts: List[PostItem]
 
-
-class HealthResponse(BaseModel):
-    status: str
-    browser_ready: bool
-    authenticated: bool

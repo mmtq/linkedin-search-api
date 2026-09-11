@@ -6,14 +6,57 @@ from app.models.schemas import (
     JobsResponse,
     PostsResponse,
     SearchResponse,
-    HealthResponse,
 )
 from app.services.linkedin_scraper import scraper_service
-from app.core.browser import chrome_manager
-from app.core.config import settings
+from app.core.exceptions import SessionExpiredException, ScraperNavigationError
 
 router = APIRouter(prefix="/api", tags=["LinkedIn Search"])
 
+
+# ---------------------------------------------------------------------------
+# Shared error handler helpers
+# ---------------------------------------------------------------------------
+
+SESSION_EXPIRED_HINT = (
+    "LinkedIn session is expired or invalid. "
+    "Re-authenticate by running `python login.py` on the server and restarting. "
+    "If using li_at.txt fallback: update it with a fresh cookie from your browser."
+)
+
+
+def _handle_scraper_error(e: Exception, context: str) -> None:
+    """
+    Converts known scraper exceptions into appropriate HTTP errors.
+    Falls through to a generic 500 for unexpected errors.
+    """
+    if isinstance(e, SessionExpiredException):
+        print(f"🔒 [AUTH ERROR] {context}: {e}", flush=True)
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "error": "session_expired",
+                "message": SESSION_EXPIRED_HINT,
+                "redirect_url": e.redirect_url or None,
+            },
+        )
+    if isinstance(e, ScraperNavigationError):
+        print(f"🌐 [NAV ERROR] {context}: {e}", flush=True)
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "navigation_failed",
+                "message": f"LinkedIn navigation error: {e.cause}",
+                "url": e.url,
+            },
+        )
+    # Unexpected error
+    print(f"❌ [ERROR] {context}: {e}", flush=True)
+    raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
 
 @router.get("/jobs", response_model=JobsResponse)
 async def get_jobs(
@@ -27,6 +70,7 @@ async def get_jobs(
     Search for LinkedIn job postings across multiple pages sorted by most recent (or relevant).
     Browses with human-like progressive scrolling and non-uniform delays.
     """
+    print(f"💼 [JOBS REQUEST] Query='{query}' | Location='{location}' | Pages={pages} | Limit={limit} | Sort={sort_by}", flush=True)
     try:
         sort_latest = sort_by.lower() == "latest"
         jobs = await asyncio.to_thread(
@@ -37,6 +81,7 @@ async def get_jobs(
             limit=limit,
             sort_by_latest=sort_latest,
         )
+        print(f"💼 [JOBS COMPLETE] Found {len(jobs)} jobs successfully.", flush=True)
         return {
             "query": query,
             "location": location,
@@ -45,8 +90,10 @@ async def get_jobs(
             "count": len(jobs),
             "jobs": jobs,
         }
+    except (SessionExpiredException, ScraperNavigationError) as e:
+        _handle_scraper_error(e, f"JOBS query='{query}'")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error scraping jobs: {str(e)}")
+        _handle_scraper_error(e, f"JOBS query='{query}'")
 
 
 @router.get("/posts", response_model=PostsResponse)
@@ -60,6 +107,7 @@ async def get_posts(
     Search for LinkedIn posts and articles across multiple pages sorted by most recent (or relevant).
     Browses with human-like scrolling, 'Load more' triggering, and natural pauses.
     """
+    print(f"📝 [POSTS REQUEST] Query='{query}' | Pages={pages} | Limit={limit} | Sort={sort_by}", flush=True)
     try:
         sort_latest = sort_by.lower() == "latest"
         posts = await asyncio.to_thread(
@@ -69,6 +117,7 @@ async def get_posts(
             limit=limit,
             sort_by_latest=sort_latest,
         )
+        print(f"📝 [POSTS COMPLETE] Found {len(posts)} posts successfully.", flush=True)
         return {
             "query": query,
             "sort_by": sort_by,
@@ -76,38 +125,46 @@ async def get_posts(
             "count": len(posts),
             "posts": posts,
         }
+    except (SessionExpiredException, ScraperNavigationError) as e:
+        _handle_scraper_error(e, f"POSTS query='{query}'")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error scraping posts: {str(e)}")
+        _handle_scraper_error(e, f"POSTS query='{query}'")
 
 
 @router.get("/search", response_model=SearchResponse)
 async def search_all(
-    query: str = Query("software engineer", description="Search keyword for jobs and posts"),
+    query: str = Query("software engineer", description="Search keyword for both jobs and posts"),
     location: str = Query("Bangladesh", description="Location filter for jobs"),
-    pages: int = Query(5, ge=1, le=10, description="Number of pages to scrape per category (1-5)"),
-    sort_by: str = Query("latest", pattern="^(latest|relevant)$", description="Sort order: 'latest' or 'relevant'"),
+    pages: int = Query(5, ge=1, le=10, description="Pages to scrape per category"),
+    sort_by: str = Query("latest", pattern="^(latest|relevant)$", description="'latest' or 'relevant'"),
     limit: Optional[int] = Query(None, ge=1, le=100, description="Optional cap per category"),
 ):
     """
-    Simultaneously search for both jobs and posts across multiple pages sorted by latest.
+    Search jobs AND posts simultaneously in parallel.
+    Both scrapers run in separate threads concurrently via asyncio.gather,
+    cutting total response time roughly in half versus sequential execution.
     """
+    print(f"🔎 [SEARCH] Query='{query}' | Location='{location}' | Pages={pages} | Limit={limit} | Sort={sort_by}", flush=True)
+    sort_latest = sort_by.lower() == "latest"
     try:
-        sort_latest = sort_by.lower() == "latest"
-        jobs = await asyncio.to_thread(
-            scraper_service.search_jobs,
-            query=query,
-            location=location,
-            pages=pages,
-            limit=limit,
-            sort_by_latest=sort_latest,
+        jobs, posts = await asyncio.gather(
+            asyncio.to_thread(
+                scraper_service.search_jobs,
+                query=query,
+                location=location,
+                pages=pages,
+                limit=limit,
+                sort_by_latest=sort_latest,
+            ),
+            asyncio.to_thread(
+                scraper_service.search_posts,
+                query=query,
+                pages=pages,
+                limit=limit,
+                sort_by_latest=sort_latest,
+            ),
         )
-        posts = await asyncio.to_thread(
-            scraper_service.search_posts,
-            query=query,
-            pages=pages,
-            limit=limit,
-            sort_by_latest=sort_latest,
-        )
+        print(f"🔎 [SEARCH DONE] {len(jobs)} jobs + {len(posts)} posts", flush=True)
         return {
             "query": query,
             "location": location,
@@ -118,17 +175,5 @@ async def search_all(
             "jobs": jobs,
             "posts": posts,
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error during combined search: {str(e)}")
-
-
-@router.get("/health", response_model=HealthResponse, tags=["System"])
-def get_health():
-    """
-    Health check endpoint verifying daemon, browser engine, and authentication status.
-    """
-    return {
-        "status": "healthy",
-        "browser_ready": chrome_manager.is_ready() or not settings.has_chrome_binary,
-        "authenticated": bool(settings.get_li_at_cookie()),
-    }
+    except (SessionExpiredException, ScraperNavigationError, Exception) as e:
+        _handle_scraper_error(e, f"SEARCH query='{query}'")

@@ -1,8 +1,6 @@
 import os
-import subprocess
 import threading
-import time
-import urllib.request
+from pathlib import Path
 from typing import Optional, Tuple
 
 from playwright.sync_api import Playwright, Browser, BrowserContext
@@ -10,127 +8,90 @@ from playwright.sync_api import Playwright, Browser, BrowserContext
 from app.core.config import settings
 
 
-class ChromeProcessManager:
-    """
-    Manages the background headless Chrome Dev process with CDP debugging enabled
-    when running in environments where Chrome Dev binary is installed locally.
-    """
-
-    def __init__(self, headless: bool = True):
-        self.headless = headless
-        self.process: Optional[subprocess.Popen] = None
-        self._lock = threading.Lock()
-
-    def is_ready(self) -> bool:
-        try:
-            with urllib.request.urlopen(f"{settings.CDP_URL}/json/version", timeout=0.5) as resp:
-                return resp.status == 200
-        except Exception:
-            return False
-
+# ---------------------------------------------------------------------------
+# Stub chrome_manager — kept for backward-compat with linkedin_scraper.py imports.
+# Persistent context doesn't need an external Chrome daemon.
+# ---------------------------------------------------------------------------
+class _NoOpChromeManager:
     def ensure_running(self):
-        with self._lock:
-            if not self.is_ready():
-                if not settings.has_chrome_binary:
-                    # Cloud/Render environment: Native Playwright Chromium will be used directly
-                    return
-
-                if str(settings.DEBUG_PORT) not in settings.CDP_URL:
-                    # Custom CDP URL configured; do not spawn local daemon
-                    return
-
-                print(f"Starting background Chrome Dev daemon (headless={self.headless})...", flush=True)
-                cmd = [
-                    settings.CHROME_DEV_PATH,
-                    f"--remote-debugging-port={settings.DEBUG_PORT}",
-                    f"--user-data-dir={settings.PROFILE_DIR}",
-                    "--no-first-run",
-                    "--no-default-browser-check",
-                ]
-                if self.headless:
-                    cmd.append("--headless=new")
-
-                try:
-                    self.process = subprocess.Popen(cmd)
-                    for _ in range(10):
-                        if self.is_ready():
-                            print("Background Chrome Dev daemon is ready.", flush=True)
-                            break
-                        time.sleep(0.3)
-                except Exception as e:
-                    print(f"Notice: Could not launch local Chrome binary ({e}). Falling back to native Playwright Chromium.", flush=True)
+        pass
 
     def stop(self):
-        with self._lock:
-            if self.process:
-                try:
-                    self.process.terminate()
-                except Exception:
-                    pass
-                self.process = None
+        pass
 
 
-chrome_manager = ChromeProcessManager(headless=settings.HEADLESS)
+chrome_manager = _NoOpChromeManager()
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _get_stored_li_at(context: BrowserContext) -> Optional[str]:
+    """Returns the li_at value currently stored in the persistent profile cookies."""
+    try:
+        for c in context.cookies():
+            if c["name"] == "li_at" and "linkedin.com" in c.get("domain", ""):
+                return c["value"]
+    except Exception:
+        pass
+    return None
 
 
 def inject_auth_cookies(context: BrowserContext):
     """
-    Injects authentication cookies into the browser context from:
-    1. COOKIES_JSON env var / cookies.json
-    2. LI_AT, JSESSIONID, BCOOKIE env vars
-    3. Local li_at.txt file
+    Injects the li_at cookie into the browser context.
+    JSESSIONID is NOT hardcoded — it is captured naturally by the persistent
+    profile on the first authenticated navigation and saved to disk for all
+    future runs automatically.
     """
-    cookies = settings.get_all_auth_cookies()
-    if cookies:
-        try:
-            # Filter and sanitize cookies for Playwright
-            cleaned = []
-            for c in cookies:
-                if isinstance(c, dict) and "name" in c and "value" in c:
-                    cookie_dict = {
-                        "name": str(c["name"]).strip(),
-                        "value": str(c["value"]).strip(),
-                        "domain": str(c.get("domain") or ".linkedin.com"),
-                        "path": str(c.get("path") or "/"),
-                    }
-                    if "httpOnly" in c:
-                        cookie_dict["httpOnly"] = bool(c["httpOnly"])
-                    if "secure" in c:
-                        cookie_dict["secure"] = bool(c["secure"])
-                    cleaned.append(cookie_dict)
-            if cleaned:
-                context.add_cookies(cleaned)
-        except Exception as e:
-            print(f"Notice: Could not inject cookies into context: {e}")
+    li_at = settings.get_li_at_cookie()
+    if not li_at:
+        print("Warning: No li_at cookie found in li_at.txt or env. Authentication will fail.", flush=True)
+        return
+    try:
+        context.add_cookies([
+            {
+                "name": "li_at",
+                "value": li_at,
+                "domain": ".linkedin.com",
+                "path": "/",
+                "httpOnly": True,
+                "secure": True,
+                "sameSite": "None",
+            }
+        ])
+        print("  -> li_at injected into persistent profile.", flush=True)
+    except Exception as e:
+        print(f"Notice: Could not inject li_at cookie: {e}", flush=True)
 
 
-def create_browser_session(p: Playwright) -> Tuple[Browser, BrowserContext, bool]:
+# ---------------------------------------------------------------------------
+# Session creation / teardown
+# ---------------------------------------------------------------------------
+
+def create_browser_session(p: Playwright) -> Tuple[None, BrowserContext, bool]:
     """
-    Creates and returns a browser session (browser, context, is_cdp).
-    Works universally:
-    - On Windows / local dev: Connects via CDP to Chrome Dev if daemon is running.
-    - On Render / Linux / Docker: Launches native Playwright Chromium with anti-bot arguments.
-    Automatically injects li_at auth cookies into the context.
+    Creates a **persistent** browser context rooted at `linkedin-profile/`.
+
+    First run
+    ---------
+    Profile directory is empty. li_at is injected from li_at.txt.
+    LinkedIn sets JSESSIONID and all other session cookies on first page load.
+    Playwright automatically saves all of this to disk.
+
+    Subsequent runs
+    ---------------
+    Full session state (cookies, localStorage, IndexedDB, JSESSIONID) is
+    reloaded from disk. li_at is only re-injected when li_at.txt changes.
+    LinkedIn sees the exact same browser/device fingerprint → li_at stays stable.
     """
-    chrome_manager.ensure_running()
+    profile_dir = settings.PROFILE_DIR
+    Path(profile_dir).mkdir(parents=True, exist_ok=True)
 
-    if chrome_manager.is_ready():
-        try:
-            browser = p.chromium.connect_over_cdp(settings.CDP_URL)
-            context = browser.contexts[0] if browser.contexts else browser.new_context(
-                viewport={"width": 1920, "height": 1080},
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-            )
-            inject_auth_cookies(context)
-            return browser, context, True
-        except Exception as e:
-            print(f"CDP connect failed ({e}), falling back to native Chromium...")
-
-    # Native Playwright Chromium (Standard for Linux / Render / Docker deployment)
-    storage_state = settings.get_storage_state()
-    browser = p.chromium.launch(
-        headless=settings.HEADLESS,
-        args=[
+    launch_kwargs: dict = {
+        "headless": settings.HEADLESS,
+        "args": [
             "--no-sandbox",
             "--disable-setuid-sandbox",
             "--disable-dev-shm-usage",
@@ -139,45 +100,72 @@ def create_browser_session(p: Playwright) -> Tuple[Browser, BrowserContext, bool
             "--no-first-run",
             "--no-default-browser-check",
         ],
-    )
-    
-    context_kwargs = {
         "viewport": {"width": 1920, "height": 1080},
-        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-        "locale": "en-US",
-        "extra_http_headers": {
-            "accept-language": "en-US,en;q=0.9",
-        },
+        "user_agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/130.0.0.0 Safari/537.36"
+        ),
+        "locale": settings.LOCALE,
+        "timezone_id": settings.TIMEZONE,
+        "extra_http_headers": {"accept-language": "en-US,en;q=0.9"},
     }
-    if storage_state:
-        context_kwargs["storage_state"] = storage_state
 
-    context = browser.new_context(**context_kwargs)
-    
-    # Hide automation flags
+    if settings.PROXY_SERVER:
+        proxy_config = {"server": settings.PROXY_SERVER}
+        if settings.PROXY_USERNAME and settings.PROXY_PASSWORD:
+            proxy_config["username"] = settings.PROXY_USERNAME
+            proxy_config["password"] = settings.PROXY_PASSWORD
+        launch_kwargs["proxy"] = proxy_config
+
+    # `launch_persistent_context` takes user_data_dir as the first positional arg
+    context = p.chromium.launch_persistent_context(str(profile_dir), **launch_kwargs)
+
+    # Hide automation signals in every page opened in this context
     try:
         context.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {
-                get: () => undefined
-            });
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            Object.defineProperty(navigator, 'plugins',   { get: () => [1, 2, 3] });
+            window.chrome = { runtime: {} };
         """)
     except Exception:
         pass
 
-    # Ensure any active li_at or custom auth cookies are injected/updated
-    inject_auth_cookies(context)
+    # Only inject li_at from file if the profile has NO existing session at all.
+    # Once login.py has been used to log in, the profile has its OWN independent
+    # session. We must NOT overwrite it with the li_at from your real browser tab —
+    # that would make both share one token and cause LinkedIn to rotate/invalidate it.
+    stored_li_at = _get_stored_li_at(context)
 
-    return browser, context, False
+    if not stored_li_at:
+        # Profile is empty — either first ever run, or profile was wiped.
+        # Seed from li_at.txt as a last resort (user should prefer using login.py).
+        current_li_at = settings.get_li_at_cookie()
+        if current_li_at:
+            print("Persistent profile is empty — seeding li_at from li_at.txt...", flush=True)
+            print("  TIP: Run `python login.py` once for a more stable independent session.", flush=True)
+            inject_auth_cookies(context)
+        else:
+            print("Warning: No li_at in profile or li_at.txt. Run `python login.py` to log in.", flush=True)
+    else:
+        print("Persistent profile loaded with existing session. Ready.", flush=True)
+
+    # persistent context owns its browser internally; no separate Browser object needed
+    return None, context, False
 
 
-def close_browser_session(browser: Browser, context: BrowserContext, is_cdp: bool):
+def close_browser_session(browser, context: BrowserContext, is_cdp: bool = False):
     """
-    Cleans up browser resources after a scraping run.
+    Closes the persistent browser context.
+    Playwright automatically flushes all session state to disk before closing.
     """
     try:
-        if not is_cdp:
-            context.close()
-            browser.close()
+        context.close()
     except Exception:
         pass
-
+    # browser is None for persistent context — nothing extra to close
+    if browser is not None:
+        try:
+            browser.close()
+        except Exception:
+            pass

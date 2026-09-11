@@ -9,6 +9,7 @@ from playwright.sync_api import sync_playwright
 
 from app.core.config import settings
 from app.core.browser import create_browser_session, close_browser_session, chrome_manager
+from app.core.exceptions import SessionExpiredException, ScraperNavigationError
 from app.services.parsers import parse_jobs_html, parse_posts_html, extract_job_description_from_html
 
 
@@ -91,25 +92,84 @@ def _expand_all_inline_posts(page):
         pass
 
 
+def _warmup_session(page, context, timeout: int = 30000):
+    """
+    Visits linkedin.com/feed/ to warm up the authenticated session before
+    hitting search/content endpoints. Required on the first run of a new
+    persistent profile.
+
+    Raises SessionExpiredException if LinkedIn redirects to a login/auth page,
+    which means the stored session is expired and re-authentication is needed.
+    """
+    try:
+        print("  -> Warming up session via linkedin.com/feed/ ...", flush=True)
+        page.goto("https://www.linkedin.com/feed/", wait_until="commit", timeout=timeout)
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=15000)
+        except Exception:
+            pass
+        current_url = page.url
+        auth_indicators = ("login", "authwall", "checkpoint", "signup", "uas/authenticate")
+        if any(ind in current_url for ind in auth_indicators):
+            print(f"  -> Session expired: warmup redirected to {current_url}", flush=True)
+            raise SessionExpiredException(redirect_url=current_url)
+        print(f"  -> Session warm-up OK ({current_url[:60]})", flush=True)
+        human_sleep(1.5, 2.5)
+    except SessionExpiredException:
+        raise  # Re-raise without swallowing
+    except Exception as e:
+        # Network hiccup during warmup — log and continue; the main nav will catch auth issues
+        print(f"  -> Warm-up note (non-fatal): {e}", flush=True)
+
+
 def _safe_goto(page, context, url: str, timeout: int = 40000):
     """
     Navigates safely to LinkedIn URLs preserving the authenticated session state.
-    If a navigation glitch occurs, it re-verifies session cookies and retries.
+    Uses 'commit' wait state to accommodate LinkedIn's SPA client-side transitions.
+
+    Raises:
+        SessionExpiredException: if LinkedIn redirects to an auth/login page.
+        ScraperNavigationError: if navigation fails for non-auth reasons after retry.
     """
+    auth_indicators = ("login", "authwall", "checkpoint", "signup", "uas/authenticate")
+
+    def _check_auth_redirect(pg):
+        """Raise SessionExpiredException if the page landed on a login/auth URL."""
+        landed = pg.url
+        if any(ind in landed for ind in auth_indicators):
+            raise SessionExpiredException(redirect_url=landed)
+
     try:
-        page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+        page.goto(url, wait_until="commit", timeout=timeout)
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=15000)
+        except Exception:
+            pass
+        _check_auth_redirect(page)
         return page
+    except SessionExpiredException:
+        raise  # Bubble up immediately — no retry will fix an expired session
     except Exception as e:
         err_msg = str(e)
-        if "ERR_TOO_MANY_REDIRECTS" in err_msg or "net::ERR_" in err_msg:
-            print(f"Notice: Navigation retry on ({err_msg}). Re-verifying authenticated cookies...", flush=True)
+        if "ERR_TOO_MANY_REDIRECTS" in err_msg or "net::ERR_" in err_msg or "Timeout" in err_msg:
+            print(f"Notice: Navigation retry on ({err_msg[:120]}). Re-verifying session...", flush=True)
             from app.core.browser import inject_auth_cookies
             inject_auth_cookies(context)
-            time.sleep(1.0)
-            page.goto(url, wait_until="domcontentloaded", timeout=timeout)
-            return page
+            time.sleep(2.0)
+            try:
+                page.goto(url, wait_until="commit", timeout=timeout)
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=15000)
+                except Exception:
+                    pass
+                _check_auth_redirect(page)
+                return page
+            except SessionExpiredException:
+                raise
+            except Exception as retry_err:
+                raise ScraperNavigationError(url=url, cause=str(retry_err)) from retry_err
         else:
-            raise e
+            raise ScraperNavigationError(url=url, cause=err_msg) from e
 
 
 class LinkedInScraperService:
@@ -137,10 +197,13 @@ class LinkedInScraperService:
             try:
                 page.set_viewport_size({"width": 1920, "height": 1080})
 
+                # Warm up session through /feed/ before hitting search endpoints
+                _warmup_session(page, context)
+
                 for page_idx in range(pages):
                     start_offset = page_idx * 25
                     url = build_jobs_url(query, location, start=start_offset, sort_by_latest=sort_by_latest)
-                    print(f"Scraping Jobs [Page {page_idx + 1}/{pages}]: {url}")
+                    print(f"🔍 Scraping Jobs [Page {page_idx + 1}/{pages}]: {url}", flush=True)
 
                     page = _safe_goto(page, context, url, timeout=40000)
                     human_sleep(2.0, 3.5)
@@ -258,7 +321,7 @@ class LinkedInScraperService:
                     for j in target_jobs:
                         if not j.get("description") and j.get("url"):
                             try:
-                                print(f"  -> Direct fetching missing description for: {j.get('title')}")
+                                print(f"  -> 📄 Direct fetching missing description for: {j.get('title')}", flush=True)
                                 direct_page = context.new_page()
                                 try:
                                     direct_page = _safe_goto(direct_page, context, j["url"], timeout=20000)
@@ -287,7 +350,7 @@ class LinkedInScraperService:
                                     except Exception:
                                         pass
                             except Exception as fetch_err:
-                                print(f"  -> Fallback fetch note: {fetch_err}")
+                                print(f"  -> Fallback fetch note: {fetch_err}", flush=True)
 
                     # Accumulate unique jobs
                     new_on_page = 0
@@ -298,7 +361,7 @@ class LinkedInScraperService:
                             all_jobs.append(j)
                             new_on_page += 1
 
-                    print(f"  -> Page {page_idx + 1} added {new_on_page} new jobs (with descriptions). Total collected: {len(all_jobs)}")
+                    print(f"  -> ✅ Page {page_idx + 1} added {new_on_page} new jobs (with descriptions). Total: {len(all_jobs)}", flush=True)
 
                     # Stop if no new jobs were found on the page or limit is reached
                     if new_on_page == 0:
@@ -339,9 +402,12 @@ class LinkedInScraperService:
             browser, context, is_cdp = create_browser_session(p)
             page = context.new_page()
             try:
+                # Warm up session through /feed/ before hitting search endpoints
+                _warmup_session(page, context)
+
                 # Open initial content search URL sorted by latest
                 url = build_posts_url(query, page_num=None, sort_by_latest=sort_by_latest)
-                print(f"Scraping Posts (up to {pages} pages/batches): {url}")
+                print(f"🔍 Scraping Posts (up to {pages} pages/batches): {url}", flush=True)
 
                 page = _safe_goto(page, context, url, timeout=40000)
                 human_sleep(3.0, 4.0)
@@ -366,10 +432,10 @@ class LinkedInScraperService:
                             except Exception:
                                 pass
                             loc.first.click(timeout=2000, force=True)
-                            print(f"  -> Successfully clicked load more on batch {round_num}")
+                            print(f"  -> 📜 Successfully clicked load more on batch {round_num}", flush=True)
                             human_sleep(3.0, 4.0)
                         except Exception as e:
-                            print(f"  -> Click note on batch {round_num}: {e}")
+                            print(f"  -> Click note on batch {round_num}: {e}", flush=True)
 
                     # Expand all inline "... see more" / "… আরও" buttons to get 100% full text
                     _expand_all_inline_posts(page)
@@ -387,7 +453,7 @@ class LinkedInScraperService:
                             all_posts.append(post)
                             new_on_page += 1
 
-                    print(f"  -> Batch {round_num} added {new_on_page} new posts. Total collected: {len(all_posts)}")
+                    print(f"  -> ✅ Batch {round_num} added {new_on_page} new posts. Total: {len(all_posts)}", flush=True)
 
                     if limit and len(all_posts) >= limit:
                         all_posts = all_posts[:limit]
