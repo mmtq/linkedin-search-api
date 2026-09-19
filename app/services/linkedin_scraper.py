@@ -10,7 +10,13 @@ from playwright.sync_api import sync_playwright
 from app.core.config import settings
 from app.core.browser import create_browser_session, close_browser_session, chrome_manager
 from app.core.exceptions import SessionExpiredException, ScraperNavigationError
-from app.services.parsers import parse_jobs_html, parse_posts_html, extract_job_description_from_html
+from app.services.parsers import (
+    parse_jobs_html,
+    parse_posts_html,
+    extract_job_description_from_html,
+    canonicalize_job_url,
+    canonicalize_company_url,
+)
 
 
 def build_jobs_url(query: str, location: str, start: int = 0, sort_by_latest: bool = True) -> str:
@@ -211,9 +217,9 @@ class LinkedInScraperService:
                     # Human-like progressive scrolling down the jobs list panel & clicking cards to capture descriptions
                     cards_loc = page.locator('li[data-occludable-job-id], div.job-card-container, div.jobs-search-results-list__list-item, div.base-card')
                     card_count = cards_loc.count()
-                    descriptions_by_id = {}
-                    descriptions_by_url = {}
-                    descriptions_by_title = {}
+                    details_by_id = {}
+                    details_by_url = {}
+                    details_by_title = {}
 
                     needed_limit = (limit - len(all_jobs)) if limit else card_count
                     cards_to_process = min(card_count, needed_limit) if limit else card_count
@@ -247,24 +253,81 @@ class LinkedInScraperService:
                             }""")
                             human_sleep(0.3, 0.5)
 
-                            # Extract complete un-truncated description text from details pane
-                            desc = page.evaluate("""() => {
-                                const el = document.querySelector('#job-details') || 
-                                           document.querySelector('.jobs-description-content__text') || 
-                                           document.querySelector('article.jobs-description__container') ||
-                                           document.querySelector('.jobs-box__html-content') ||
-                                           document.querySelector('.jobs-description');
-                                return el ? el.innerText.trim() : null;
+                            # Extract complete un-truncated description and top-card details from details pane
+                            pane_data = page.evaluate("""() => {
+                                const descEl = document.querySelector('#job-details') || 
+                                               document.querySelector('.jobs-description-content__text') || 
+                                               document.querySelector('article.jobs-description__container') ||
+                                               document.querySelector('.jobs-box__html-content') ||
+                                               document.querySelector('.jobs-description');
+                                const desc = descEl ? descEl.innerText.trim() : null;
+
+                                const tertEl = document.querySelector('.job-details-jobs-unified-top-card__tertiary-description-container') ||
+                                               document.querySelector('.jobs-unified-top-card__primary-description');
+                                const tertText = tertEl ? tertEl.innerText.trim() : '';
+
+                                let postedText = null;
+                                const posSpan = document.querySelector('.job-details-jobs-unified-top-card__tertiary-description-container span.tvm__text--positive strong span');
+                                if (posSpan && posSpan.innerText.trim()) {
+                                    postedText = posSpan.innerText.trim();
+                                } else if (tertText) {
+                                    const m = tertText.match(/(?:·|\\n|^)\\s*(\\d+\\s+(?:minute|hour|day|week|month|year)s?\\s+ago|\\d+[smhdwy]|just now)\\s*(?:·|\\n|$)/i);
+                                    if (m) postedText = m[1].trim();
+                                }
+
+                                let applicants = null;
+                                if (tertText) {
+                                    const mApp = tertText.match(/(\\d+\\+?\\s+applicants?|over\\s+\\d+\\s+applicants?|be among the first\\s+\\d+\\s+applicants?)/i);
+                                    if (mApp) applicants = mApp[1].trim();
+                                }
+
+                                const fitButtons = Array.from(document.querySelectorAll('.job-details-fit-level-preferences button, .jobs-unified-top-card__job-insight'));
+                                const fitTexts = fitButtons.map(b => (b.innerText || '').trim()).filter(Boolean);
+                                
+                                let workplace = null;
+                                let employment = null;
+                                fitTexts.forEach(t => {
+                                    const low = t.toLowerCase();
+                                    if (['remote', 'hybrid', 'on-site', 'onsite'].includes(low)) workplace = t;
+                                    if (['full-time', 'part-time', 'contract', 'temporary', 'internship', 'volunteer'].includes(low)) employment = t;
+                                });
+
+                                const compA = document.querySelector('.job-details-jobs-unified-top-card__primary-description-container a[href*="/company/"]') ||
+                                              document.querySelector('.jobs-search__job-details a[href*="/company/"]');
+                                const compHref = compA ? compA.getAttribute('href') : null;
+
+                                let applyType = null;
+                                const applyBtn = document.querySelector('.jobs-apply-button, #jobs-apply-button-id, .jobs-s-apply button');
+                                if (applyBtn) {
+                                    const btnText = (applyBtn.innerText || '').toLowerCase();
+                                    const aria = (applyBtn.getAttribute('aria-label') || '').toLowerCase();
+                                    if (btnText.includes('easy apply') || aria.includes('easy apply')) {
+                                        applyType = 'easy_apply';
+                                    } else {
+                                        applyType = 'external';
+                                    }
+                                }
+
+                                return {
+                                    desc: desc,
+                                    posted_text: postedText,
+                                    applicant_count_text: applicants,
+                                    workplace_type: workplace,
+                                    employment_type: employment,
+                                    company_url: compHref,
+                                    apply_type: applyType
+                                };
                             }""")
 
+                            desc = pane_data.get("desc") if pane_data else None
                             if not desc:
-                                # Fallback to parser on right details container HTML
                                 desc = extract_job_description_from_html(page.content())
+                                if pane_data:
+                                    pane_data["desc"] = desc
 
                             link_el = card.locator("a[href*='/jobs/view/'], a.job-card-list__title--link, a.job-card-container__link").first
                             raw_href = link_el.get_attribute("href") if link_el.count() > 0 else ""
                             
-                            # Extract numeric job ID from href or attributes
                             card_occludable_id = card.get_attribute("data-occludable-job-id") or ""
                             card_job_id = card.get_attribute("data-job-id") or ""
                             m_id = (
@@ -275,44 +338,53 @@ class LinkedInScraperService:
                             )
                             job_id = m_id.group(1) if m_id else None
 
-                            clean_url = None
-                            if raw_href:
-                                clean_url = raw_href.split("?")[0]
-                                if not clean_url.startswith("http"):
-                                    clean_url = "https://www.linkedin.com" + clean_url
-
+                            clean_url = canonicalize_job_url(raw_href, job_id)
                             title_el = card.locator("a.job-card-list__title--link, a.job-card-container__link, strong, h3").first
                             title = (title_el.text_content() or "").strip() if title_el.count() > 0 else None
 
-                            if desc and len(desc) > 80:
+                            if pane_data:
                                 if job_id:
-                                    descriptions_by_id[job_id] = desc
+                                    details_by_id[job_id] = pane_data
                                 if clean_url:
-                                    descriptions_by_url[clean_url] = desc
+                                    details_by_url[clean_url] = pane_data
                                 if title:
-                                    descriptions_by_title[title] = desc
+                                    details_by_title[title] = pane_data
                         except Exception:
                             pass
 
                     # Final brief settling pause before parsing HTML
                     human_sleep(0.6, 1.2)
                     html = page.content()
-                    page_jobs = parse_jobs_html(html)
+                    page_jobs = parse_jobs_html(html, page_num=page_idx + 1)
 
-                    # Enrich jobs with captured descriptions
+                    # Enrich jobs with captured descriptions and details
                     for j in page_jobs:
                         j_url = j.get("url") or ""
                         j_title = j.get("title") or ""
                         m_jid = re.search(r"/jobs/view/(\d+)", j_url) or re.search(r"(\d{8,})", j_url)
                         j_id = m_jid.group(1) if m_jid else None
 
-                        j_desc = (
-                            (descriptions_by_id.get(j_id) if j_id else None)
-                            or descriptions_by_url.get(j_url)
-                            or descriptions_by_title.get(j_title)
-                            or None
+                        d = (
+                            (details_by_id.get(j_id) if j_id else None)
+                            or details_by_url.get(j_url)
+                            or details_by_title.get(j_title)
+                            or {}
                         )
-                        j["description"] = j_desc
+
+                        if not j.get("description") and d.get("desc"):
+                            j["description"] = d["desc"]
+                        if not j.get("posted_text") and d.get("posted_text"):
+                            j["posted_text"] = d["posted_text"]
+                        if not j.get("applicant_count_text") and d.get("applicant_count_text"):
+                            j["applicant_count_text"] = d["applicant_count_text"]
+                        if not j.get("employment_type") and d.get("employment_type"):
+                            j["employment_type"] = d["employment_type"]
+                        if not j.get("workplace_type") and d.get("workplace_type"):
+                            j["workplace_type"] = d["workplace_type"]
+                        if not j.get("company_url") and d.get("company_url"):
+                            j["company_url"] = canonicalize_company_url(d["company_url"])
+                        if not j.get("apply_type") and d.get("apply_type"):
+                            j["apply_type"] = d["apply_type"]
 
                     # Guaranteed 100% fallback: if any job description is still None, fetch direct view URL
                     needed_limit = (limit - len(all_jobs)) if limit else len(page_jobs)
@@ -442,7 +514,7 @@ class LinkedInScraperService:
                     human_sleep(0.5, 0.9)
 
                     html = page.content()
-                    page_posts = parse_posts_html(html)
+                    page_posts = parse_posts_html(html, page_num=round_num)
 
                     # Accumulate unique posts
                     new_on_page = 0
@@ -476,3 +548,5 @@ class LinkedInScraperService:
 
 
 scraper_service = LinkedInScraperService()
+search_jobs = scraper_service.search_jobs
+search_posts = scraper_service.search_posts
