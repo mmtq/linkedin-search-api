@@ -4,6 +4,8 @@ __pycache__
 .git
 .gitignore
 linkedin-profile
+auspost-profile
+*-profile
 *.html
 scratch
 .system_generated
